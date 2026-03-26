@@ -11,7 +11,6 @@ python scripts/process.py \
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import List
 
@@ -22,6 +21,58 @@ import torch
 import sam3
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
+
+
+HUMAN_PROMPT_SET = [
+    "person",
+    "people",
+    "man",
+    "woman",
+    "boy",
+    "girl",
+    "child",
+    "adult",
+]
+
+
+def box_iou_xyxy(box1: List[float], box2: List[float]) -> float:
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    inter_w = max(0.0, x2 - x1)
+    inter_h = max(0.0, y2 - y1)
+    inter = inter_w * inter_h
+    area1 = max(0.0, box1[2] - box1[0]) * max(0.0, box1[3] - box1[1])
+    area2 = max(0.0, box2[2] - box2[0]) * max(0.0, box2[3] - box2[1])
+    union = area1 + area2 - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def nms_indices(boxes: List[List[float]], scores: List[float], iou_threshold: float) -> List[int]:
+    if not boxes:
+        return []
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    keep: List[int] = []
+    while order:
+        cur = order.pop(0)
+        keep.append(cur)
+        remain: List[int] = []
+        for i in order:
+            if box_iou_xyxy(boxes[cur], boxes[i]) <= iou_threshold:
+                remain.append(i)
+        order = remain
+    return keep
+
+
+def expand_prompt(prompt: str, use_human_preset: bool) -> List[str]:
+    prompt_clean = prompt.strip()
+    prompt_lower = prompt_clean.lower()
+    if use_human_preset and prompt_lower in {"human", "person", "people"}:
+        return HUMAN_PROMPT_SET
+    return [prompt_clean]
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +122,17 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Confidence threshold used by Sam3Processor.",
     )
+    parser.add_argument(
+        "--human-preset",
+        action="store_true",
+        help="If prompt is human/person/people, expand to multiple human-related prompts and merge.",
+    )
+    parser.add_argument(
+        "--nms-iou",
+        type=float,
+        default=0.5,
+        help="NMS IoU threshold used when merging detections from expanded prompts.",
+    )
     return parser.parse_args()
 
 
@@ -110,7 +172,6 @@ def main() -> None:
     out_root = Path(args.output_dir).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
-    sam3_root = Path(sam3.__file__).resolve().parent.parent
     checkpoint_path = args.checkpoint_path
     if checkpoint_path is not None:
         checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
@@ -156,33 +217,52 @@ def main() -> None:
     )
 
     for prompt in prompts:
-        processor.reset_all_prompts(state)
-        state = processor.set_text_prompt(prompt=prompt, state=state)
+        candidate_prompts = expand_prompt(prompt, args.human_preset)
 
         prompt_safe = sanitize_name(prompt)
         prompt_dir = out_root / prompt_safe
         prompt_dir.mkdir(parents=True, exist_ok=True)
 
-        masks = state["masks"].squeeze(1).detach().cpu().numpy().astype(np.uint8)
-        boxes = state["boxes"].detach().cpu().numpy().tolist()
-        scores = state["scores"].detach().cpu().numpy().tolist()
+        merged_masks: List[np.ndarray] = []
+        merged_boxes: List[List[float]] = []
+        merged_scores: List[float] = []
+        merged_sources: List[str] = []
+
+        for cand_prompt in candidate_prompts:
+            processor.reset_all_prompts(state)
+            state = processor.set_text_prompt(prompt=cand_prompt, state=state)
+
+            cand_masks = state["masks"].squeeze(1).detach().cpu().numpy().astype(np.uint8)
+            cand_boxes = state["boxes"].detach().cpu().numpy().tolist()
+            cand_scores = state["scores"].detach().cpu().numpy().tolist()
+
+            for idx in range(len(cand_scores)):
+                merged_masks.append(cand_masks[idx])
+                merged_boxes.append([float(v) for v in cand_boxes[idx]])
+                merged_scores.append(float(cand_scores[idx]))
+                merged_sources.append(cand_prompt)
+
+        keep = nms_indices(merged_boxes, merged_scores, args.nms_iou)
+        keep_sorted = sorted(keep, key=lambda i: merged_scores[i], reverse=True)
 
         overlay = base_np.copy()
         records = []
 
-        for idx, mask in enumerate(masks):
+        for out_idx, idx in enumerate(keep_sorted):
+            mask = merged_masks[idx]
             color = palette[idx % len(palette)]
             overlay = blend_mask_on_image(overlay, mask, color)
 
             mask_img = (mask * 255).astype(np.uint8)
-            mask_path = prompt_dir / f"mask_{idx:03d}.png"
+            mask_path = prompt_dir / f"mask_{out_idx:03d}.png"
             Image.fromarray(mask_img, mode="L").save(mask_path)
 
             records.append(
                 {
-                    "id": idx,
-                    "score": float(scores[idx]),
-                    "box_xyxy": [float(v) for v in boxes[idx]],
+                    "id": out_idx,
+                    "score": float(merged_scores[idx]),
+                    "box_xyxy": [float(v) for v in merged_boxes[idx]],
+                    "matched_prompt": merged_sources[idx],
                     "mask_path": str(mask_path),
                 }
             )
@@ -193,6 +273,7 @@ def main() -> None:
         prompt_json_path = prompt_dir / "result.json"
         prompt_json = {
             "prompt": prompt,
+            "candidate_prompts": candidate_prompts,
             "count": len(records),
             "results": records,
             "overlay_path": str(overlay_path),
